@@ -36,29 +36,51 @@ It outputs two files:
 
 ## How to use
 
-### Option 1: Run the Executable (Simplest)
+### Windows — Run the Executable (Simplest)
 1. Navigate to **Releases**
 2. Download and extract the **zip**
-4. Navigate inside the extradted folder
-5. Ensure **MTG Arena is running**.
-6. Go to the **Decks** or **Collection** tab in-game, scroll for 30 secs through your collection (important so your collection loads into memory).
-7. Run `MTGA_Exporter.exe`.
-8. Follow the prompts to allow the tool do find and export your collection.
+3. Navigate inside the extracted folder
+4. Ensure **MTG Arena is running**
+5. Go to the **Decks** or **Collection** tab in-game, scroll for 30 secs through your collection (important so your collection loads into memory)
+6. Run `MTGA_Exporter.exe`
+7. Follow the prompts to allow the tool to find and export your collection
 
-### Option 2: Run from Python Source
+### Windows — Run from Python Source
 1. Download and extract zip
-3. navigate inside folder
-4. Install Python 3.x.
-5. Run `install.bat` to install dependencies (`pymem`, `requests`).
-6. Run `python mtg.py`.
+2. Install Python 3.x
+3. Run `install.bat` to install dependencies
+4. Run `python mtg.py`
+
+### macOS — Run from Python Source
+MTG Arena has a native macOS app available via **Steam**.
+
+**Prerequisites:**
+- MTG Arena installed via Steam
+- Python 3.x (`brew install python` if needed)
+
+**Steps:**
+1. Start MTG Arena via Steam
+2. Go to the **Decks** or **Collection** tab and scroll through your collection for ~30 seconds (so the game loads all cards into memory)
+3. Open Terminal, navigate to this folder
+4. Run `bash install.sh` once to install dependencies
+5. Run the exporter with sudo (required to read game memory):
+   ```
+   sudo python3 mtg.py
+   ```
+6. Follow the prompts
+
+> **Why sudo?** macOS restricts cross-process memory access. Running with `sudo` grants the necessary permissions, equivalent to "Run as Administrator" on Windows.
 
 ## Troubleshooting
-- If the tool cannot find your collection, ensure you have visited the Collection/Decks tab.
-- Try providing different anchor cards if the first attempt fails (rarer anchor cards such as [O:legendary] work better, as they are more unique to your collection).
-- Run as Administrator if you encounter permission errors.
+- **Collection not found:** Make sure you visited the Collection/Decks tab and scrolled through it before running the tool.
+- **Try different anchors:** Rarer cards (Legendary, Mythic) work better as anchors because they are more unique in your collection.
+- **Windows:** Run as Administrator if you encounter permission errors.
+- **macOS:** Run with `sudo python3 mtg.py` if you see a "Cannot access game memory" error.
+- **macOS — process not found:** Make sure MTGA is open via Steam. If using CrossOver instead, the script also searches for `MTGA.exe` in Wine processes.
 
 ## Files
-- `MTGA_Exporter.exe`: The standalone application.
-- `mtg.py`: The source code.
+- `MTGA_Exporter.exe`: Standalone Windows application.
+- `mtg.py`: Cross-platform Python source (Windows + macOS).
 - `requirements.txt`: Python dependencies.
-- `install.bat`: Setup script for Python users.
+- `install.bat`: Setup script for Windows.
+- `install.sh`: Setup script for macOS.

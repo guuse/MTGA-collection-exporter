@@ -1,2 +1,2 @@
-pymem
 requests
+pymem; sys_platform == "win32"
