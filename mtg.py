@@ -455,7 +455,9 @@ def scan_collection(pm, db):
 
     MIN_ENTRIES = 30     # ignore tiny coincidental blocks
     MAX_COUNT = 1000     # owned counts are small; rejects pointer/garbage values
-    GAP = 8              # tolerate empty dictionary slots inside a block
+    GAP = 32             # bridge gaps from deleted slots / cards missing from the
+                         # database. The collection block is stable for GAP 16..64
+                         # (verified); 32 sits safely in that plateau.
 
     best = {}
     print_progress(0, total, prefix='Mem Scan:', suffix='Starting', length=25)
