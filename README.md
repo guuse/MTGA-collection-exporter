@@ -1,3 +1,10 @@
+# Changelog - V3.0
+
+- **No more anchor cards needed** — the scanner now finds your collection automatically. Just run it.
+- Fixed partial/incomplete exports: the scanner now reads MTGA's collection dictionary directly (validated against the card database), capturing your full collection instead of a small fragment.
+- Cross-platform memory scanning (Windows + macOS) with no manual setup.
+- Fixed Scryfall fallback (now sends the required request headers).
+
 # Changelog - V1.2
 
 - added priority for local card sql database, scryfall used as backup
@@ -42,8 +49,7 @@ It outputs two files:
 3. Navigate inside the extracted folder
 4. Ensure **MTG Arena is running**
 5. Go to the **Decks** or **Collection** tab in-game, scroll for 30 secs through your collection (important so your collection loads into memory)
-6. Run `MTGA_Exporter.exe`
-7. Follow the prompts to allow the tool to find and export your collection
+6. Run `MTGA_Exporter.exe` — it scans automatically and writes the export files next to itself
 
 ### Windows — Run from Python Source
 1. Download and extract zip
@@ -67,13 +73,11 @@ MTG Arena has a native macOS app available via **Steam**.
    ```
    sudo python3 mtg.py
    ```
-6. Follow the prompts
 
 > **Why sudo?** macOS restricts cross-process memory access. Running with `sudo` grants the necessary permissions, equivalent to "Run as Administrator" on Windows.
 
 ## Troubleshooting
-- **Collection not found:** Make sure you visited the Collection/Decks tab and scrolled through it before running the tool.
-- **Try different anchors:** Rarer cards (Legendary, Mythic) work better as anchors because they are more unique in your collection.
+- **Collection not found:** Make sure you visited the Collection/Decks tab and scrolled through it before running the tool, so the cards are loaded into memory.
 - **Windows:** Run as Administrator if you encounter permission errors.
 - **macOS:** Run with `sudo python3 mtg.py` if you see a "Cannot access game memory" error.
 - **macOS — process not found:** Make sure MTGA is open via Steam. If using CrossOver instead, the script also searches for `MTGA.exe` in Wine processes.

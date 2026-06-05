@@ -1,6 +1,5 @@
 import json
 import struct
-import difflib
 import requests
 import sys
 import csv
@@ -13,6 +12,12 @@ from pathlib import Path
 import time
 import threading
 
+# Ensure the progress bar's block characters print on any console code page.
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 PLATFORM = platform.system()  # 'Windows', 'Darwin', 'Linux'
 
 if PLATFORM == 'Windows':
@@ -22,6 +27,11 @@ if PLATFORM == 'Windows':
     except ImportError:
         pymem = None
 
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
 # Configuration
 if getattr(sys, 'frozen', False):
     SCRIPT_DIR = Path(sys.executable).parent
@@ -29,7 +39,6 @@ else:
     SCRIPT_DIR = Path(__file__).resolve().parent
 
 LOOKUP_FILE = SCRIPT_DIR / "arena_id_lookup.json"
-ANCHOR_FILE = SCRIPT_DIR / "last_anchors.json"
 OUTPUT_JSON = SCRIPT_DIR / "mtga_collection.json"
 OUTPUT_TXT = SCRIPT_DIR / "mtga_collection.txt"
 OUTPUT_CSV = SCRIPT_DIR / "mtga_collection.csv"
@@ -167,7 +176,7 @@ class MacOSMemReader:
             result.extend(cb.raw[:co.value] if r == self.KERN_SUCCESS else b'\x00' * chunk)
         return bytes(result)
 
-    def _get_readable_regions(self):
+    def get_readable_regions(self):
         """Return list of (address, size) for all readable memory regions."""
         regions = []
         address = ctypes.c_uint64(1)
@@ -200,30 +209,6 @@ class MacOSMemReader:
             address.value = next_addr
 
         return regions
-
-    def pattern_scan_all(self, pattern, return_multiple=False):
-        """Scan all readable memory regions for the given byte pattern."""
-        results = []
-        chunk = 4 * 1024 * 1024
-
-        for region_addr, region_size in self._get_readable_regions():
-            for offset in range(0, region_size, chunk):
-                read_size = min(chunk + len(pattern), region_size - offset)
-                if read_size < len(pattern):
-                    break
-
-                data = self.read_bytes(region_addr + offset, read_size)
-                pos = 0
-                while True:
-                    idx = data.find(pattern, pos)
-                    if idx == -1:
-                        break
-                    results.append(region_addr + offset + idx)
-                    if not return_multiple:
-                        return results
-                    pos = idx + 1
-
-        return results
 
 
 # ─── MTGA database helpers ────────────────────────────────────────────────────
@@ -387,102 +372,127 @@ def load_card_database():
     return lookup
 
 
-# ─── User interaction ─────────────────────────────────────────────────────────
+# ─── Memory scanning (anchor-free) ────────────────────────────────────────────
+#
+# MTGA keeps the owned collection in a C# Dictionary<int,int> (grpId -> count).
+# A .NET dictionary stores its entries as an array of structs laid out as
+# [hashCode, next, key, value] -> 4x uint32 per entry (stride 4); key=grpId and
+# value=owned count sit at offsets 2 and 3. Older/array layouts use a plain
+# [id, count] pairing (stride 2). We don't need user-supplied "anchor" cards:
+# we read every readable private memory region, validate ids against the card
+# database, and keep the largest contiguous block of valid (id -> count) entries.
 
-def get_user_anchors(name_to_id):
-    """Interactive anchor setup with auto-save."""
-    if ANCHOR_FILE.exists():
+_MEM_COMMIT = 0x1000
+_MEM_PRIVATE = 0x20000
+_PAGE_GUARD = 0x100
+_READABLE_PROT = {0x02, 0x04, 0x20, 0x40}  # READONLY, READWRITE, EXECUTE_READ, EXECUTE_READWRITE
+
+
+class _MEMORY_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BaseAddress", ctypes.c_ulonglong),
+        ("AllocationBase", ctypes.c_ulonglong),
+        ("AllocationProtect", ctypes.c_ulong),
+        ("__alignment1", ctypes.c_ulong),
+        ("RegionSize", ctypes.c_ulonglong),
+        ("State", ctypes.c_ulong),
+        ("Protect", ctypes.c_ulong),
+        ("Type", ctypes.c_ulong),
+        ("__alignment2", ctypes.c_ulong),
+    ]
+
+
+def iter_readable_regions(pm):
+    """Yield (base, size) for readable memory regions, platform-aware."""
+    if PLATFORM == 'Windows':
+        VirtualQueryEx = ctypes.windll.kernel32.VirtualQueryEx
+        VirtualQueryEx.restype = ctypes.c_size_t
+        VirtualQueryEx.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(_MEMORY_BASIC_INFORMATION), ctypes.c_size_t,
+        ]
+        handle = pm.process_handle
+        mbi = _MEMORY_BASIC_INFORMATION()
+        addr = 0
+        while VirtualQueryEx(handle, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            if (mbi.State == _MEM_COMMIT and mbi.Type == _MEM_PRIVATE
+                    and (mbi.Protect & 0xFF) in _READABLE_PROT and not (mbi.Protect & _PAGE_GUARD)):
+                yield mbi.BaseAddress, mbi.RegionSize
+            nxt = mbi.BaseAddress + mbi.RegionSize
+            if nxt <= addr:
+                break
+            addr = nxt
+    else:
+        for base, size in pm.get_readable_regions():
+            yield base, size
+
+
+def _merged_runs(mask, gap):
+    """Return (start, end) for True-runs in a bool array, bridging gaps <= gap."""
+    if not mask.any():
+        return []
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], mask.view(np.int8), [0]))))
+    starts, ends = edges[0::2], edges[1::2]
+    merged = []
+    for s, e in zip(starts.tolist(), ends.tolist()):
+        if merged and s - merged[-1][1] <= gap:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    return merged
+
+
+def scan_collection(pm, db):
+    """Anchor-free scan: return the largest {grpId: count} block found in memory."""
+    if np is None:
+        raise Exception("numpy is required for scanning. Install it with: pip install numpy")
+
+    valid = np.array(sorted(db.keys()), dtype=np.uint32)
+
+    print("Enumerating memory regions...")
+    regions = list(iter_readable_regions(pm))
+    total = len(regions) or 1
+
+    MIN_ENTRIES = 30     # ignore tiny coincidental blocks
+    MAX_COUNT = 1000     # owned counts are small; rejects pointer/garbage values
+    GAP = 8              # tolerate empty dictionary slots inside a block
+
+    best = {}
+    print_progress(0, total, prefix='Mem Scan:', suffix='Starting', length=25)
+    for ri, (base, size) in enumerate(regions):
         try:
-            with ANCHOR_FILE.open("r", encoding="utf-8") as f:
-                saved = json.load(f)
-                if saved and isinstance(saved, list):
-                    print("\n[Previous Anchors Found]")
-                    for i, (_, qty, name) in enumerate(saved, 1):
-                        print(f"  {i}. {name} (x{qty})")
-                    if input("  Use these? [Y/n]: ").lower() not in ('n', 'no'):
-                        return saved
-        except Exception: pass
+            data = pm.read_bytes(base, size)
+        except Exception:
+            data = None
+        if data:
+            n = len(data) // 4
+            if n >= 8:
+                a = np.frombuffer(data, dtype=np.uint32, count=n)
+                # stride 4 = C# Dictionary entries; stride 2 = plain [id, count] array
+                for stride, idoff, cntoff in ((4, 2, 3), (2, 0, 1)):
+                    for align in range(stride):
+                        ids = a[align + idoff::stride]
+                        counts = a[align + cntoff::stride]
+                        m = min(len(ids), len(counts))
+                        if m < MIN_ENTRIES:
+                            continue
+                        ids, counts = ids[:m], counts[:m]
+                        mask = np.isin(ids, valid) & (counts >= 1) & (counts <= MAX_COUNT)
+                        for s, e in _merged_runs(mask, GAP):
+                            span = mask[s:e]
+                            if int(span.sum()) <= len(best):
+                                continue
+                            d = {int(i): int(c)
+                                 for i, c in zip(ids[s:e][span].tolist(),
+                                                 counts[s:e][span].tolist())}
+                            if len(d) > len(best):
+                                best = d
+        print_progress(ri + 1, total, prefix='Mem Scan:', suffix=f'{len(best)} cards', length=25)
 
-    print("\n[Setup] Enter 5 unique owned cards (Rares/Mythics best) to calibrate scanner.")
-
-    anchors = []
-    while len(anchors) < 5:
-        print(f"\nCard #{len(anchors) + 1} (Enter empty to finish):")
-        name_input = input("  Name: ").strip()
-
-        if not name_input:
-            if anchors: break
-            print("  Required.")
-            continue
-
-        search = name_input.lower()
-        cid = name_to_id.get(search)
-
-        if not cid:
-            matches = difflib.get_close_matches(search, name_to_id.keys(), n=5, cutoff=0.5)
-            if not matches:
-                print("  Not found. Check spelling.")
-                continue
-
-            if len(matches) == 1:
-                final_name = matches[0]
-                print(f"  Assuming: {final_name.title()}")
-            else:
-                print("  Did you mean?")
-                for i, m in enumerate(matches, 1): print(f"    {i}. {m.title()}")
-                sel = input("  Select #: ")
-                if not sel.isdigit() or not (1 <= int(sel) <= len(matches)): continue
-                final_name = matches[int(sel)-1]
-
-            cid = name_to_id[final_name]
-            name_input = final_name.title()
-
-        try:
-            qty = int(input(f"  Quantity of '{name_input}': "))
-            if qty < 1: raise ValueError
-            anchors.append((cid, qty, name_input))
-        except ValueError:
-            print("  Invalid quantity.")
-            continue
-
-    if anchors:
-        try:
-            with ANCHOR_FILE.open("w", encoding="utf-8") as f:
-                json.dump(anchors, f, indent=2)
-        except Exception: pass
-
-    return anchors
+    return best
 
 
-# ─── Memory scanning ──────────────────────────────────────────────────────────
-
-def find_blocks(pm, addr):
-    """Reads memory around address to find card array."""
-    try:
-        data = pm.read_bytes(max(0, addr - 1024*1024), 4*1024*1024)
-        ints = struct.unpack(f'<{len(data)//4}I', data)
-
-        blocks = []
-        for off in (0, 1):
-            curr = {}
-            misses = 0
-            for i in range(off, len(ints)-1, 2):
-                k, v = ints[i], ints[i+1]
-                if 1000 <= k < 500000 and 1 <= v <= 400:
-                    curr[k] = v
-                    misses = 0
-                else:
-                    misses += 1
-
-                if misses > 50:
-                    if len(curr) > 50: blocks.append(curr)
-                    curr = {}
-                    misses = 0
-            if len(curr) > 50: blocks.append(curr)
-
-        return blocks
-    except Exception: return []
-
+# ─── Output ───────────────────────────────────────────────────────────────────
 
 def open_output_folder(path):
     """Reveal output file in Finder (macOS) or Explorer (Windows)."""
@@ -521,8 +531,13 @@ def connect_to_mtga():
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    print(f"MTGA Collection Exporter | v2.1 | {PLATFORM}")
+    print(f"MTGA Collection Exporter | v3.0 | {PLATFORM}")
     print(f"Output Folder: {SCRIPT_DIR}\n")
+
+    if np is None:
+        print("[Error] numpy is required. Install it with: pip install numpy")
+        input("Press Enter to exit.")
+        return
 
     db = load_card_database()
     if not db:
@@ -542,44 +557,18 @@ def main():
         input("Press Enter to exit.")
         return
 
-    anchors = get_user_anchors({v["name"].lower(): k for k, v in db.items()})
-    if not anchors: return
+    print("\nScanning memory for collection data (no anchors needed)...")
+    collection = scan_collection(pm, db)
 
-    print("\nScanning memory for collection data...")
-    matches = []
-    total_anchors = len(anchors)
-
-    print_progress(0, total_anchors, prefix='Mem Scan:', suffix='Init...', length=25)
-
-    for i, (aid, aqty, aname) in enumerate(anchors):
-        display_name = (aname[:15] + '..') if len(aname) > 15 else aname
-        print_progress(i, total_anchors, prefix='Mem Scan:', suffix=f'Find {display_name}', length=25)
-
-        res = pm.pattern_scan_all(struct.pack('<II', aid, aqty), return_multiple=True)
-
-        if res:
-            matches.extend(res)
-            print_progress(total_anchors, total_anchors, prefix='Mem Scan:', suffix='Found!', length=25)
-            if aqty > 1: break
-
-        print_progress(i + 1, total_anchors, prefix='Mem Scan:', suffix='Done', length=25)
-
-    if not matches:
-        print("\nScanner failed to locate collection from anchors.")
+    if not collection:
+        print("\nCould not locate your collection in memory.")
+        print("Open MTG Arena, visit the Collection or Decks tab and scroll through")
+        print("your cards (so they load into memory), then run this again.")
         input("Press Enter to exit.")
         return
 
-    candidates = []
-    for m in matches:
-        candidates.extend(find_blocks(pm, m))
-
-    if not candidates:
-        print("No valid data blocks found.")
-        input("Press Enter to exit.")
-        return
-
-    collection = max(candidates, key=len)
-    print(f"\n[Success] Found {len(collection)} unique entries.")
+    print(f"\n[Success] Found {len(collection)} unique cards "
+          f"({sum(collection.values())} total).")
 
     processed = {}
     for cid, qty in collection.items():
