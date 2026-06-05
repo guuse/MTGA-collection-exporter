@@ -1,0 +1,17 @@
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# Generated/cached data
+arena_id_lookup.json
+last_anchors.json
+
+# Exported collection files
+mtga_collection.json
+mtga_collection.txt
+mtga_collection.csv
